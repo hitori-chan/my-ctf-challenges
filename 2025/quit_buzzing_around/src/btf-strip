@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""BTF Source Code Stripper
+
+Removes source file/line information from BPF object BTF sections.
+"""
+
+import struct
+import sys
+from pathlib import Path
+from elftools.elf.elffile import ELFFile
+
+# BTF Kind constants
+BTF_KIND_INT = 1
+BTF_KIND_PTR = 2
+BTF_KIND_ARRAY = 3
+BTF_KIND_STRUCT = 4
+BTF_KIND_UNION = 5
+BTF_KIND_ENUM = 6
+BTF_KIND_FWD = 7
+BTF_KIND_TYPEDEF = 8
+BTF_KIND_VOLATILE = 9
+BTF_KIND_CONST = 10
+BTF_KIND_RESTRICT = 11
+BTF_KIND_FUNC = 12
+BTF_KIND_FUNC_PROTO = 13
+BTF_KIND_VAR = 14
+BTF_KIND_DATASEC = 15
+BTF_KIND_FLOAT = 16
+BTF_KIND_DECL_TAG = 17
+BTF_KIND_TYPE_TAG = 18
+BTF_KIND_ENUM64 = 19
+
+
+class BTFStripper:
+    """Strip source code from BTF sections in BPF ELF files"""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = bytearray(self.path.read_bytes())
+        self.btf_off = None
+        self.ext_off = None
+        self.strings = {}
+        self.src_offs = set()
+        self.remap = {}
+
+        self.locate_sections()
+
+    def locate_sections(self):
+        """Locate BTF sections"""
+        with self.path.open('rb') as f:
+            elf = ELFFile(f)
+            btf = elf.get_section_by_name('.BTF')
+            ext = elf.get_section_by_name('.BTF.ext')
+            self.btf_off = btf['sh_offset'] if btf else None
+            self.ext_off = ext['sh_offset'] if ext else None
+
+    def u32(self, off):
+        """Read uint32"""
+        return struct.unpack('<I', self.data[off:off+4])[0]
+
+    def set_u32(self, off, val):
+        """Write uint32"""
+        struct.pack_into('<I', self.data, off, val)
+
+    def parse_btf_header(self):
+        """Parse BTF header"""
+        o = self.btf_off
+        hdr_len, type_off, type_len, str_off, str_len = struct.unpack(
+            '<IIIII', self.data[o+4:o+24])
+
+        return {
+            'type_len': type_len,
+            'str_len': str_len,
+            'type_start': o + hdr_len + type_off,
+            'str_start': o + hdr_len + str_off,
+        }
+
+    def parse_strings(self, hdr):
+        """Parse BTF string table"""
+        start, end = hdr['str_start'], hdr['str_start'] + hdr['str_len']
+        data = bytes(self.data[start:end])
+
+        self.strings[0] = b''
+        i = 1
+        while i < len(data):
+            if data[i-1] == 0:
+                s = i
+                i = data.find(b'\x00', i)
+                if i == -1:
+                    break
+                if i > s:
+                    self.strings[s] = data[s:i]
+                i += 1
+            else:
+                i += 1
+
+    def parse_line_info(self):
+        """Extract source offsets from BTF.ext line_info"""
+        if not self.ext_off:
+            return
+
+        o = self.ext_off
+        hdr_len, line_off, line_len = struct.unpack('<III',
+            self.data[o+4:o+8] + self.data[o+16:o+24])
+
+        if line_len == 0:
+            return
+
+        data = bytes(self.data[o + hdr_len + line_off:
+                               o + hdr_len + line_off + line_len])
+        pos = 4
+
+        while pos + 8 <= len(data):
+            pos += 4
+            num = struct.unpack('<I', data[pos:pos+4])[0]
+            pos += 4
+
+            if num == 0 or num > 1000:
+                break
+
+            for _ in range(num):
+                if pos + 16 > len(data):
+                    break
+                _, file_off, line_off, _ = struct.unpack('<IIII', data[pos:pos+16])
+                self.src_offs.update([file_off, line_off])
+                pos += 16
+
+    def rebuild_strings(self):
+        """Rebuild string table without source strings"""
+        out = bytearray(b'\x00')
+        self.remap[0] = 0
+
+        for off in sorted(self.strings.keys()):
+            if off > 0 and off not in self.src_offs:
+                self.remap[off] = len(out)
+                out.extend(self.strings[off])
+                out.append(0)
+
+        return bytes(out)
+
+    def update_name(self, off):
+        """Update name offset if it needs remapping"""
+        val = self.u32(off)
+        if val in self.remap:
+            self.set_u32(off, self.remap[val])
+
+    def update_types(self, hdr):
+        """
+        Iterate through BTF types and update their name offsets.
+        This parser respects the BTF type format to avoid corrupting non-offset data.
+        """
+        start = hdr['type_start']
+        end = start + hdr['type_len']
+        curr = start
+
+        while curr < end:
+            # Type Header (12 bytes):
+            # name_off (4), info (4), size/type (4)
+            self.update_name(curr)
+            
+            info = self.u32(curr + 4)
+            kind = (info >> 24) & 0x1f
+            vlen = info & 0xffff
+            
+            curr += 12 # Advance past header
+
+            if kind == BTF_KIND_INT:
+                curr += 4
+            elif kind == BTF_KIND_ARRAY:
+                curr += 12 # type(4), index_type(4), nelems(4)
+            elif kind in (BTF_KIND_STRUCT, BTF_KIND_UNION):
+                for _ in range(vlen):
+                    self.update_name(curr) # name_off for member
+                    curr += 12 # name_off(4), type(4), offset(4)
+            elif kind == BTF_KIND_ENUM:
+                for _ in range(vlen):
+                    self.update_name(curr) # name_off for enumerator
+                    curr += 8 # name_off(4), val(4)
+            elif kind == BTF_KIND_FUNC_PROTO:
+                for _ in range(vlen):
+                    self.update_name(curr) # name_off for parameter
+                    curr += 8 # name_off(4), type(4)
+            elif kind == BTF_KIND_VAR:
+                curr += 4 # linkage(4)
+            elif kind == BTF_KIND_DATASEC:
+                # btf_var_secinfo: type(4), offset(4), size(4) - no name offsets
+                curr += 12 * vlen
+            elif kind == BTF_KIND_DECL_TAG:
+                curr += 4 # component_idx(4)
+            elif kind == BTF_KIND_ENUM64:
+                for _ in range(vlen):
+                    self.update_name(curr) # name_off for enumerator
+                    curr += 12 # name_off(4), val_lo(4), val_hi(4)
+            
+            # Kinds with no extra data after header:
+            # PTR, FWD, TYPEDEF, VOLATILE, CONST, RESTRICT, FUNC, FLOAT, TYPE_TAG
+
+    def rebuild_btf(self, hdr, new_strs):
+        """Rebuild BTF section"""
+        new_btf = struct.pack('<HBBIIIII', 0xeb9f, 1, 0, 24, 0,
+                             hdr['type_len'], hdr['type_len'], len(new_strs))
+        new_btf += self.data[hdr['type_start']:hdr['type_start']+hdr['type_len']]
+        new_btf += new_strs
+
+        old_size = 24 + hdr['type_len'] + hdr['str_len']
+        pad = old_size - len(new_btf)
+        self.data[self.btf_off:self.btf_off+old_size] = new_btf + bytes(pad)
+
+        return old_size, len(new_btf)
+
+    def update_ext_subsection(self, hdr_off, updater):
+        """Update BTF.ext subsection with callback"""
+        if not self.ext_off:
+            return
+
+        o = self.ext_off
+        hdr_len, sec_off, sec_len = struct.unpack('<III',
+            self.data[o+4:o+8] + self.data[o+hdr_off:o+hdr_off+8])
+
+        if sec_len == 0:
+            return
+
+        start = o + hdr_len + sec_off
+        data = bytearray(self.data[start:start+sec_len])
+        updater(data)
+        self.data[start:start+sec_len] = bytes(data)
+
+    def update_func_info(self):
+        """Update func_info section names"""
+        def updater(d):
+            p = 4
+            while p + 8 <= len(d):
+                off = struct.unpack('<I', d[p:p+4])[0]
+                if off in self.remap:
+                    struct.pack_into('<I', d, p, self.remap[off])
+                p += 4
+
+                num = struct.unpack('<I', d[p:p+4])[0]
+                p += 4
+                if num == 0 or num > 1000:
+                    break
+                p += num * 8
+
+        self.update_ext_subsection(8, updater)
+
+    def clear_line_info(self):
+        """Zero out line_info section"""
+        if not self.ext_off:
+            return
+
+        o = self.ext_off
+        hdr_len, line_off, line_len = struct.unpack('<III',
+            self.data[o+4:o+8] + self.data[o+16:o+24])
+
+        if line_len > 0:
+            self.set_u32(o + 20, 0)
+            start = o + hdr_len + line_off
+            self.data[start:start+line_len] = bytes(line_len)
+
+    def update_core_relos(self):
+        """Update CO-RE relocation access strings"""
+        def updater(d):
+            p = 4
+            while p + 8 <= len(d):
+                off = struct.unpack('<I', d[p:p+4])[0]
+                if off in self.remap:
+                    struct.pack_into('<I', d, p, self.remap[off])
+                p += 4
+
+                num = struct.unpack('<I', d[p:p+4])[0]
+                p += 4
+                if num == 0 or num > 1000:
+                    break
+
+                for _ in range(num):
+                    if p + 16 > len(d):
+                        break
+                    off = struct.unpack('<I', d[p+8:p+12])[0]
+                    if off in self.remap:
+                        struct.pack_into('<I', d, p + 8, self.remap[off])
+                    p += 16
+
+        self.update_ext_subsection(24, updater)
+
+    def update_section_size(self, name, size):
+        """Update ELF section header size"""
+        with self.path.open('rb') as f:
+            elf = ELFFile(f)
+            for i, sect in enumerate(elf.iter_sections()):
+                if sect.name == name:
+                    sh_off = elf['e_shoff'] + i * elf['e_shentsize']
+                    struct.pack_into('<Q', self.data, sh_off + 32, size)
+                    return
+
+    def strip(self):
+        """Strip source code from BTF"""
+        if not self.btf_off:
+            return False
+
+        hdr = self.parse_btf_header()
+        self.parse_strings(hdr)
+        self.parse_line_info()
+
+        src_count = len(self.src_offs & set(self.strings.keys()))
+        if src_count == 0:
+            return False
+
+        new_strs = self.rebuild_strings()
+        self.update_types(hdr)
+        old_sz, new_sz = self.rebuild_btf(hdr, new_strs)
+
+        self.update_func_info()
+        self.clear_line_info()
+        self.update_core_relos()
+        self.update_section_size('.BTF', new_sz)
+
+        self.path.write_bytes(self.data)
+
+        print(f"Stripped {src_count} source strings")
+        print(f"BTF: {old_sz} → {new_sz} bytes (-{old_sz-new_sz})")
+        return True
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: btf-strip <file.bpf.o>")
+        sys.exit(1)
+
+    path = Path(sys.argv[1])
+    if not path.exists():
+        print(f"Error: {path} not found")
+        sys.exit(1)
+
+    try:
+        BTFStripper(path).strip()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

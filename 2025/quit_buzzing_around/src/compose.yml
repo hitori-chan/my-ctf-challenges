@@ -1,0 +1,17 @@
+services:
+  chall:
+    build: .
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - /sys/kernel/tracing/:/sys/kernel/tracing/:ro
+    ports:
+      - 1338:22
+    restart: unless-stopped
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: 0.5
+          memory: 250M
+          pids: 256
